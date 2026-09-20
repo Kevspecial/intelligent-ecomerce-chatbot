@@ -4,3 +4,4 @@ __pycache__/
 .bedrock_agentcore/
 .env
 .DS_Store
+.claude/
