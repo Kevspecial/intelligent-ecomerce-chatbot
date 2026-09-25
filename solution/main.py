@@ -24,8 +24,10 @@ import argparse, json
 import os, asyncio, boto3
 from strands.hooks import (
     HookProvider, AfterInvocationEvent, HookRegistry, MessageAddedEvent,
+    AfterToolCallEvent,
 )
 import logging
+from contextlib import ExitStack
 import uuid
 from typing import Dict
 from bedrock_agentcore.tools.code_interpreter_client import code_session
@@ -251,6 +253,39 @@ def search_knowledge_base(query: str) -> str:
 #   4. Include a fallback that computes only the tier discount if the
 #      Code Interpreter is unavailable
 
+TIER_RATES = {"Silver": 0.00, "Gold": 0.10, "Platinum": 0.15}
+
+
+def _tier_only_discount(loyalty_points: int, tier: str, order_total: float, reason: str) -> str:
+    """
+    Fallback used when the Code Interpreter is unavailable: apply ONLY the
+    tier discount (computed locally), redeem no points and earn none, and
+    return the same fields as the sandbox result so the agent can answer.
+    """
+    tier = tier.strip().title()
+    rate = TIER_RATES.get(tier, 0.0)
+    tier_discount = round(order_total * rate, 2)
+    final_total = round(order_total - tier_discount, 2)
+    return json.dumps({
+        "order_total": order_total,
+        "tier": tier,
+        "tier_rate": rate,
+        "tier_discount_pct": round(rate * 100, 2),
+        "points_redeemed": 0,
+        "points_value": 0.0,
+        "tier_discount": tier_discount,
+        "final_total": final_total,
+        "total_savings": tier_discount,
+        "remaining_points": int(loyalty_points),
+        "fallback": True,
+        "note": (
+            "Code Interpreter unavailable - only the tier discount was applied; "
+            "loyalty points were not redeemed. Tell the customer this is an "
+            f"estimate. ({reason})"
+        ),
+    })
+
+
 @tool
 def calculate_loyalty_discount(
     loyalty_points: int,
@@ -308,6 +343,7 @@ result = {{
     "order_total": order_total,
     "tier": tier,
     "tier_rate": tier_rate,
+    "tier_discount_pct": round(tier_rate * 100, 2),
     "points_redeemed": points_redeemed,
     "points_value": points_value,
     "subtotal_after_points": subtotal,
@@ -327,24 +363,17 @@ print(json.dumps(result))
                 {"code": code, "language": "python", "clearContext": True},
             )
             for event in resp["stream"]:
-                return json.dumps(event["result"])
+                result = event["result"]
+                # A sandbox-side failure comes back as a normal event with
+                # isError set, not as an exception — treat it as unavailable.
+                if result.get("isError"):
+                    raise RuntimeError(f"Code Interpreter error: {result}")
+                return json.dumps(result)
         raise RuntimeError("Code Interpreter returned no result")
 
     except Exception as e:
-        # Fallback: tier discount only, computed locally, clearly flagged so
-        # the agent can tell the customer points were not applied.
-        logger.warning(f"Code Interpreter unavailable, using fallback: {e}")
-        tier_rates = {"Silver": 0.00, "Gold": 0.10, "Platinum": 0.15}
-        rate = tier_rates.get(tier.strip().title(), 0.0)
-        discount = round(order_total * rate, 2)
-        return json.dumps({
-            "order_total": order_total,
-            "tier": tier,
-            "tier_discount": discount,
-            "final_total": round(order_total - discount, 2),
-            "points_redeemed": 0,
-            "note": "Code Interpreter unavailable; loyalty points were not applied.",
-        })
+        logger.warning(f"Code Interpreter unavailable, using tier-only fallback: {e}")
+        return _tier_only_discount(loyalty_points, tier, order_total, str(e)[:200])
 
 
 # ── TODO 8 — Agent Entrypoint ─────────────────────────────────────────────────
@@ -409,6 +438,76 @@ Guidelines:
 - Be concise and clear. Ask for missing details (e.g. order ID) rather than guessing.
 """
 
+# Appended to the system prompt when the Gateway cannot be reached, so the
+# agent still answers KB / loyalty / browser questions and tells the customer
+# clearly that live order and refund services are down.
+GATEWAY_UNAVAILABLE_NOTE = """
+IMPORTANT: The order and refund services (get_order, get_customer, get_customer_orders,
+initiate_refund, check_refund_status, get_return_label) are temporarily unavailable.
+If the customer needs order tracking, customer details or a refund, apologise, explain that
+these services are temporarily unavailable, and ask them to try again in a few minutes.
+Never make up order, tracking or refund details.
+"""
+
+GATEWAY_TOOL_ERROR_MESSAGE = (
+    "The {tool} service could not complete this request ({detail}). "
+    "Tell the customer this service is temporarily unavailable or the details "
+    "could not be found, ask them to double-check any IDs or try again shortly, "
+    "and do not invent any order, tracking or refund information."
+)
+
+
+class GatewayErrorHook(HookProvider):
+    """
+    Turns failed or empty Gateway tool results into a clear, meaningful
+    message for the model, so the customer is told what went wrong instead
+    of the agent receiving a raw stack trace, an HTTP error body, or nothing.
+    """
+
+    def __init__(self, gateway_tool_names):
+        self.gateway_tool_names = set(gateway_tool_names)
+
+    @staticmethod
+    def _failure_detail(result) -> str | None:
+        """Return a short failure description, or None if the result is fine."""
+        texts = [c["text"] for c in result.get("content", []) if "text" in c]
+        joined = "\n".join(t for t in texts if t.strip())
+        if result.get("status") == "error":
+            return joined[:300] or "the service returned an error"
+        if not joined:
+            return "the service returned an empty response"
+        # Lambda targets wrap their payload as {"statusCode": ..., "body": ...};
+        # API targets may return {"error": ...} for 4xx responses.
+        try:
+            data = json.loads(joined)
+        except (ValueError, TypeError):
+            return None
+        if isinstance(data, dict):
+            if isinstance(data.get("statusCode"), int) and data["statusCode"] >= 400:
+                return f"HTTP {data['statusCode']}: {data.get('body', '')}"[:300]
+            if "error" in data:
+                return str(data["error"])[:300]
+        return None
+
+    def handle_tool_result(self, event: AfterToolCallEvent):
+        tool_name = event.tool_use["name"]
+        if tool_name not in self.gateway_tool_names:
+            return
+        detail = self._failure_detail(event.result)
+        if detail is None:
+            return
+        logger.warning(f"Gateway tool {tool_name} failed: {detail}")
+        event.result = {
+            "toolUseId": event.result["toolUseId"],
+            "status": "error",
+            "content": [{"text": GATEWAY_TOOL_ERROR_MESSAGE.format(
+                tool=tool_name.split("___")[-1], detail=detail,
+            )}],
+        }
+
+    def register_hooks(self, registry: HookRegistry) -> None:  # type: ignore
+        registry.add_callback(AfterToolCallEvent, self.handle_tool_result)
+
 
 @app.entrypoint
 async def invoke(payload, context=None):
@@ -439,29 +538,48 @@ async def invoke(payload, context=None):
 
         # The MCP connection must stay open for the whole agent run, because
         # gateway tools are executed over it — hence Agent lives inside `with`.
-        mcp_client = MCPClient(
-            url=GATEWAY_URL,
-            auth_provider=GatewaySigV4Auth(REGION),
-        )
-        with mcp_client:
-            gateway_tools = mcp_client.list_tools_sync()
-            tools.extend(gateway_tools)
-            logger.info(f"Loaded {len(gateway_tools)} gateway tools")
+        # ExitStack lets us keep going with local tools if the Gateway is down.
+        with ExitStack() as stack:
+            system_prompt = SYSTEM_PROMPT
+            hooks = [memory_hook]
+            try:
+                mcp_client = MCPClient(
+                    url=GATEWAY_URL,
+                    auth_provider=GatewaySigV4Auth(REGION),
+                )
+                stack.enter_context(mcp_client)
+                gateway_tools = mcp_client.list_tools_sync()
+                if not gateway_tools:
+                    raise RuntimeError("Gateway returned no tools")
+                tools.extend(gateway_tools)
+                hooks.append(GatewayErrorHook(t.tool_name for t in gateway_tools))
+                logger.info(f"Loaded {len(gateway_tools)} gateway tools")
+            except Exception as e:
+                # Gateway unreachable (network, auth, expired credentials, ...):
+                # degrade gracefully and tell the customer, rather than failing.
+                logger.error(f"Gateway connection failed, continuing without it: {e}")
+                system_prompt += GATEWAY_UNAVAILABLE_NOTE
 
             agent = Agent(
                 model=model,
                 tools=tools,
-                hooks=[memory_hook],
-                system_prompt=SYSTEM_PROMPT,
+                hooks=hooks,
+                system_prompt=system_prompt,
                 callback_handler=None,
             )
             response = agent(user_input)
 
-        return response.message["content"][0]["text"]
+        return str(response).strip() or (
+            "I'm sorry, I wasn't able to produce a response. Please try again."
+        )
 
-    except Exception as e:
+    except Exception:
         logger.exception("Agent invocation failed")
-        return f"I'm sorry, something went wrong while handling your request: {e}"
+        return (
+            "I'm sorry, I'm having trouble reaching our support systems right now. "
+            "Please try again in a few minutes. If the problem continues, "
+            "contact customer service and mention your order ID."
+        )
 
 
 # ── CLI entry point (do not modify) ──────────────────────────────────────────
